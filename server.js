@@ -16,6 +16,11 @@
 //   - Öldüren kişinin adı 'youDied' event'inde client'a gonderiliyor.
 //   - Basit, kalici (sunucu ayakta oldugu surece) Hall of Fame
 //     (en yuksek skorlar) - ayri, seyrek yayinlanan bir event.
+//   - Hesap sistemi YERINE, cihaz bazli kalici profil: istemci
+//     localStorage'da rastgele bir deviceId tutar, sunucu bu id'ye
+//     bagli en iyi skor / toplam kill / oynanan mac sayisini bir
+//     JSON dosyasinda (data/profiles.json) SAKLAR - sunucu yeniden
+//     baslasa bile kaybolmaz. Sifre/giris yok, sifir surtunme.
 //
 //  Calistirmak icin:
 //    npm install express socket.io
@@ -26,6 +31,7 @@
 const express = require('express');
 const http = require('http');
 const path = require('path');
+const fs = require('fs');
 const { Server } = require('socket.io');
 
 const app = express();
@@ -64,6 +70,9 @@ const COLORS = ['#ff2079','#00b8d4','#7cc900','#ff9500','#8a3ffc','#ff5c5c',
   '#00b894','#e91e8c','#0fb5d6','#c9a400','#ff6a00','#2ecc71'];
 
 const HEX_RE = /^#[0-9a-fA-F]{6}$/;
+const DEVICE_ID_RE = /^[a-zA-Z0-9_-]{8,64}$/;
+const PROFILES_FILE = path.join(__dirname, 'data', 'profiles.json');
+const PROFILE_SAVE_INTERVAL_MS = 5000;
 
 // Paper.io tarzi 4 yon (yukari, asagi, sol, sag)
 const DIRS = [
@@ -139,6 +148,73 @@ function sanitizeColor(raw) {
   return (typeof raw === 'string' && HEX_RE.test(raw)) ? raw : null;
 }
 
+function sanitizeDeviceId(raw) {
+  return (typeof raw === 'string' && DEVICE_ID_RE.test(raw)) ? raw : null;
+}
+
+// ---------------------------------------------------------
+// CIHAZ BAZLI KALICI PROFIL (hesap sistemi yerine hafif alternatif)
+// ---------------------------------------------------------
+let deviceProfiles = {};   // deviceId -> { name, bestScore, totalKills, gamesPlayed, bestArea }
+let profilesDirty = false;
+
+function loadProfiles() {
+  try {
+    if (fs.existsSync(PROFILES_FILE)) {
+      deviceProfiles = JSON.parse(fs.readFileSync(PROFILES_FILE, 'utf8'));
+      console.log(`Profiller yuklendi: ${Object.keys(deviceProfiles).length} cihaz`);
+    }
+  } catch (err) {
+    console.error('Profiller okunamadi, bos baslaniyor:', err.message);
+    deviceProfiles = {};
+  }
+}
+
+function saveProfilesIfDirty() {
+  if (!profilesDirty) return;
+  profilesDirty = false;
+  const dir = path.dirname(PROFILES_FILE);
+  try {
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(PROFILES_FILE, JSON.stringify(deviceProfiles));
+  } catch (err) {
+    console.error('Profiller kaydedilemedi:', err.message);
+  }
+}
+
+function getOrCreateProfile(deviceId) {
+  if (!deviceProfiles[deviceId]) {
+    deviceProfiles[deviceId] = { name: null, bestScore: 0, bestArea: 0, totalKills: 0, gamesPlayed: 0 };
+  }
+  return deviceProfiles[deviceId];
+}
+
+function profileOnJoin(deviceId, name) {
+  if (!deviceId) return;
+  const prof = getOrCreateProfile(deviceId);
+  prof.gamesPlayed++;
+  if (name) prof.name = name;
+  profilesDirty = true;
+}
+
+function profileOnKill(deviceId) {
+  if (!deviceId) return;
+  const prof = getOrCreateProfile(deviceId);
+  prof.totalKills++;
+  profilesDirty = true;
+}
+
+function profileOnScore(deviceId, score, areaCells) {
+  if (!deviceId) return;
+  const prof = getOrCreateProfile(deviceId);
+  let changed = false;
+  if (score > prof.bestScore) { prof.bestScore = score; changed = true; }
+  if (areaCells > prof.bestArea) { prof.bestArea = areaCells; changed = true; }
+  if (changed) profilesDirty = true;
+}
+
+loadProfiles();
+
 // Rengin baska bir aktif oyuncuda kullanilmadigindan emin olur.
 function uniqueColor(preferred) {
   const taken = new Set(Object.values(players).map(p => p.color));
@@ -190,6 +266,7 @@ function recalcScore(slot) {
   if (!p) return;
   p.areaCells = slotAreaCount[slot] || 0;
   p.score = p.areaCells + p.kills * KILL_BONUS;
+  if (p.deviceId) profileOnScore(p.deviceId, p.score, p.areaCells);
 }
 
 function updateHallOfFame(name, score) {
@@ -204,7 +281,7 @@ function updateHallOfFame(name, score) {
   if (hallOfFame.length > HALL_OF_FAME_SIZE) hallOfFame.length = HALL_OF_FAME_SIZE;
 }
 
-function spawnPlayer(socket, name, color) {
+function spawnPlayer(socket, name, color, deviceId) {
   const slot = freeSlots.pop();
   if (slot === undefined) return null; // sunucu dolu
 
@@ -215,6 +292,7 @@ function spawnPlayer(socket, name, color) {
     slot,
     name: uniqueName(name || (NAMES[Math.floor(Math.random() * NAMES.length)] + '-' + Math.floor(Math.random() * 90 + 10))),
     color: uniqueColor(color),
+    deviceId: deviceId || null,
     x: spot.x + 0.5,
     y: spot.y + 0.5,
     cellX: spot.x,
@@ -254,6 +332,7 @@ function killPlayer(p, killerSlot) {
       killer.kills++;
       recalcScore(killer.slot);
       killerName = killer.name;
+      if (killer.deviceId) profileOnKill(killer.deviceId);
       io.to(killerId).emit('killConfirm', { victim: p.name });
     }
   }
@@ -332,15 +411,28 @@ io.on('connection', (socket) => {
     palette: COLORS
   });
 
+  // Istemci baglanir baglanmaz kendi deviceId'sini bildirir; sunucu
+  // varsa gecmis profilini (en iyi skor, toplam kill vb.) geri yollar.
+  // Bu, sifre/hesap OLMADAN "beni hatirla" hissi verir.
+  socket.on('identify', (data) => {
+    const deviceId = sanitizeDeviceId(data && data.deviceId);
+    if (!deviceId) return;
+    socket.deviceId = deviceId;
+    const prof = getOrCreateProfile(deviceId);
+    socket.emit('profile', prof);
+  });
+
   socket.on('join', (data) => {
     if (players[socket.id]) return; // zaten oyunda
     const name = sanitizeName(data && data.name);
     const color = sanitizeColor(data && data.color);
-    const p = spawnPlayer(socket, name, color);
+    const deviceId = sanitizeDeviceId((data && data.deviceId)) || socket.deviceId || null;
+    const p = spawnPlayer(socket, name, color, deviceId);
     if (!p) {
       socket.emit('serverFull');
       return;
     }
+    profileOnJoin(deviceId, p.name);
     // Yeni baglanan istemciye TAM territory anlik goruntusu -
     // bundan sonraki 'state' event'leri sadece delta gonderecek.
     socket.emit('init', {
@@ -477,6 +569,11 @@ setInterval(tick, TICK_MS);
 setInterval(() => {
   io.emit('hallOfFame', hallOfFame);
 }, HALL_OF_FAME_BROADCAST_MS);
+
+// Cihaz profillerini disk'e sadece degistiyse ve seyrek yaz (I/O tasarrufu)
+setInterval(saveProfilesIfDirty, PROFILE_SAVE_INTERVAL_MS);
+process.on('SIGINT', () => { profilesDirty = true; saveProfilesIfDirty(); process.exit(0); });
+process.on('SIGTERM', () => { profilesDirty = true; saveProfilesIfDirty(); process.exit(0); });
 
 server.listen(PORT, () => {
   console.log(`Neon Arena sunucusu calisiyor -> http://localhost:${PORT}`);
