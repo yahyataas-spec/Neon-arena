@@ -1,7 +1,7 @@
 // ==========================================================
 //  NEON ARENA - server.js
 //  Express + Socket.io ile gercek zamanli coklu oyunculu
-//  "trail / territory" (iz birakma + alan kaplama) oyunu.
+//  paper.io tarzi 4 yonlu "iz birak / alan kapla" oyunu.
 //  Calistirmak icin:
 //    npm install express socket.io
 //    node server.js
@@ -26,25 +26,46 @@ const PORT = process.env.PORT || 3000;
 // ---------------------------------------------------------
 // OYUN SABITLERI
 // ---------------------------------------------------------
-const GRID_W = 60;          // grid genisligi (hucre)
-const GRID_H = 40;          // grid yuksekligi (hucre)
+const GRID_W = 110;         // grid genisligi (hucre) - buyutulmus harita
+const GRID_H = 74;          // grid yuksekligi (hucre)
 const CELL = 20;            // istemcide 1 hucre = 20px (bilgi amacli)
 const TICK_MS = 50;         // 20 tick/sn
-const SPEED = 0.12;         // hucre / tick
-const TURN_RATE = 0.18;     // rad / tick (donus hizi limiti)
-const MAX_PLAYERS = 24;
+const SPEED = 0.16;         // hucre / tick
+const MAX_PLAYERS = 32;
 const KILL_BONUS = 10;
 const RESPAWN_MS = 2000;
+const MAX_NAME_LEN = 14;
 
 const NAMES = ['Falcon','Viper','Nova','Blaze','Ghost','Volt','Zephyr','Raven',
   'Comet','Nero','Lynx','Storm','Kilo','Onyx','Pixel','Turbo','Nyx','Rogue'];
 const COLORS = ['#ff2079','#00e5ff','#7cff00','#ffb700','#b967ff','#ff5c5c',
   '#00ffa3','#ff8ac9','#5cf0ff','#f5ff5c','#ff6a00','#4dff4d'];
 
+const HEX_RE = /^#[0-9a-fA-F]{6}$/;
+
+// Paper.io tarzi 4 yon (yukari, asagi, sol, sag)
+const DIRS = [
+  { x: 1, y: 0, angle: 0 },
+  { x: 0, y: 1, angle: Math.PI / 2 },
+  { x: -1, y: 0, angle: Math.PI },
+  { x: 0, y: -1, angle: -Math.PI / 2 }
+];
+
+function snapDir(angle) {
+  const twoPi = Math.PI * 2;
+  let a = ((angle % twoPi) + twoPi) % twoPi;
+  let best = 0, bestDiff = Infinity;
+  for (let i = 0; i < DIRS.length; i++) {
+    let da = Math.abs(a - ((DIRS[i].angle % twoPi + twoPi) % twoPi));
+    if (da > Math.PI) da = twoPi - da;
+    if (da < bestDiff) { bestDiff = da; best = i; }
+  }
+  return DIRS[best];
+}
+
 // ---------------------------------------------------------
 // DURUM
 // ---------------------------------------------------------
-// territoryGrid / trailGrid: her hucre icin -1 (bos) ya da "slot" (0..MAX_PLAYERS-1)
 let territoryGrid = new Array(GRID_W * GRID_H).fill(-1);
 let trailGrid = new Array(GRID_W * GRID_H).fill(-1);
 
@@ -56,10 +77,30 @@ for (let i = MAX_PLAYERS - 1; i >= 0; i--) freeSlots.push(i);
 function idx(x, y) { return y * GRID_W + x; }
 function inBounds(x, y) { return x >= 0 && y >= 0 && x < GRID_W && y < GRID_H; }
 
+function sanitizeName(raw) {
+  if (typeof raw !== 'string') return null;
+  let n = raw.replace(/[<>]/g, '').trim().slice(0, MAX_NAME_LEN);
+  return n.length ? n : null;
+}
+
+function uniqueName(base) {
+  const taken = new Set(Object.values(players).map(p => p.name));
+  if (!taken.has(base)) return base;
+  for (let i = 2; i < 100; i++) {
+    const candidate = `${base}${i}`.slice(0, MAX_NAME_LEN);
+    if (!taken.has(candidate)) return candidate;
+  }
+  return base + Math.floor(Math.random() * 99);
+}
+
+function sanitizeColor(raw) {
+  return (typeof raw === 'string' && HEX_RE.test(raw)) ? raw : null;
+}
+
 function randomFreeSpot() {
-  for (let tries = 0; tries < 300; tries++) {
-    const x = 3 + Math.floor(Math.random() * (GRID_W - 6));
-    const y = 3 + Math.floor(Math.random() * (GRID_H - 6));
+  for (let tries = 0; tries < 400; tries++) {
+    const x = 4 + Math.floor(Math.random() * (GRID_W - 8));
+    const y = 4 + Math.floor(Math.random() * (GRID_H - 8));
     let free = true;
     for (let dx = -2; dx <= 2 && free; dx++) {
       for (let dy = -2; dy <= 2; dy++) {
@@ -98,34 +139,39 @@ function recalcScore(slot) {
   const id = slotToId[slot];
   const p = players[id];
   if (!p) return;
-  p.score = countTerritory(slot) + p.kills * KILL_BONUS;
+  p.areaCells = countTerritory(slot);
+  p.score = p.areaCells + p.kills * KILL_BONUS;
 }
 
-function spawnPlayer(socket) {
+function spawnPlayer(socket, name, color) {
   const slot = freeSlots.pop();
   if (slot === undefined) return null; // sunucu dolu
 
   const spot = randomFreeSpot();
+  const dir = DIRS[0];
   const p = {
     id: socket.id,
     slot,
-    name: NAMES[Math.floor(Math.random() * NAMES.length)] + '-' + Math.floor(Math.random() * 90 + 10),
-    color: COLORS[Math.floor(Math.random() * COLORS.length)],
+    name: uniqueName(name || (NAMES[Math.floor(Math.random() * NAMES.length)] + '-' + Math.floor(Math.random() * 90 + 10))),
+    color: color || COLORS[Math.floor(Math.random() * COLORS.length)],
     x: spot.x + 0.5,
     y: spot.y + 0.5,
     cellX: spot.x,
     cellY: spot.y,
-    angle: -Math.PI / 2,
-    desiredAngle: -Math.PI / 2,
+    dir,
+    angle: dir.angle,
     alive: true,
-    trail: [],       // [{x,y}] - o anki gecici iz (hucre koordinatlari)
-    score: 9,
+    trail: [],
+    score: 0,
+    areaCells: 0,
     kills: 0,
-    deaths: 0
+    deaths: 0,
+    joinedAt: Date.now()
   };
   claimStartArea(slot, spot.x, spot.y);
   players[socket.id] = p;
   slotToId[slot] = socket.id;
+  recalcScore(slot);
   return p;
 }
 
@@ -133,7 +179,6 @@ function killPlayer(p, killerSlot) {
   if (!p.alive) return;
   p.alive = false;
   p.deaths++;
-  // izini serbest birak
   for (const c of p.trail) {
     if (trailGrid[idx(c.x, c.y)] === p.slot) trailGrid[idx(c.x, c.y)] = -1;
   }
@@ -149,17 +194,18 @@ function killPlayer(p, killerSlot) {
     }
   }
 
+  io.emit('playerDied', { id: p.id, x: p.x, y: p.y, color: p.color });
   io.to(p.id).emit('youDied', { respawnMs: RESPAWN_MS });
 
   setTimeout(() => {
-    if (!players[p.id]) return; // baglantisi kesilmis olabilir
+    if (!players[p.id]) return;
     const spot = randomFreeSpot();
     p.x = spot.x + 0.5;
     p.y = spot.y + 0.5;
     p.cellX = spot.x;
     p.cellY = spot.y;
-    p.angle = -Math.PI / 2;
-    p.desiredAngle = -Math.PI / 2;
+    p.dir = DIRS[0];
+    p.angle = DIRS[0].angle;
     p.alive = true;
     claimStartArea(p.slot, spot.x, spot.y);
     recalcScore(p.slot);
@@ -177,32 +223,25 @@ function captureArea(p) {
   const outside = new Uint8Array(GRID_W * GRID_H);
   const queue = [];
 
-  for (let x = 0; x < GRID_W; x++) {
-    pushIfOpen(x, 0); pushIfOpen(x, GRID_H - 1);
-  }
-  for (let y = 0; y < GRID_H; y++) {
-    pushIfOpen(0, y); pushIfOpen(GRID_W - 1, y);
-  }
   function pushIfOpen(x, y) {
     const i = idx(x, y);
     if (!blocked[i] && !outside[i]) { outside[i] = 1; queue.push(i); }
   }
+  for (let x = 0; x < GRID_W; x++) { pushIfOpen(x, 0); pushIfOpen(x, GRID_H - 1); }
+  for (let y = 0; y < GRID_H; y++) { pushIfOpen(0, y); pushIfOpen(GRID_W - 1, y); }
 
   while (queue.length) {
     const i = queue.pop();
     const x = i % GRID_W, y = Math.floor(i / GRID_W);
-    const neighbors = [[x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]];
-    for (const [nx, ny] of neighbors) {
-      if (!inBounds(nx, ny)) continue;
-      const ni = idx(nx, ny);
-      if (!blocked[ni] && !outside[ni]) { outside[ni] = 1; queue.push(ni); }
-    }
+    if (x + 1 < GRID_W) pushIfOpen(x + 1, y);
+    if (x - 1 >= 0) pushIfOpen(x - 1, y);
+    if (y + 1 < GRID_H) pushIfOpen(x, y + 1);
+    if (y - 1 >= 0) pushIfOpen(x, y - 1);
   }
 
   const affectedSlots = new Set([p.slot]);
   for (let i = 0; i < territoryGrid.length; i++) {
     if (!blocked[i] && !outside[i]) {
-      // cevrelenmis hucre -> ele gecir
       const prevOwner = territoryGrid[i];
       if (prevOwner !== -1 && prevOwner !== p.slot) affectedSlots.add(prevOwner);
       territoryGrid[i] = p.slot;
@@ -218,36 +257,37 @@ function captureArea(p) {
   for (const slot of affectedSlots) recalcScore(slot);
 }
 
-function stepAngle(current, target, maxDelta) {
-  let diff = ((target - current + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
-  if (diff > maxDelta) diff = maxDelta;
-  if (diff < -maxDelta) diff = -maxDelta;
-  return current + diff;
-}
-
 // ---------------------------------------------------------
 // SOCKET.IO BAGLANTILARI
 // ---------------------------------------------------------
 io.on('connection', (socket) => {
-  const p = spawnPlayer(socket);
-  if (!p) {
-    socket.emit('serverFull');
-    socket.disconnect(true);
-    return;
-  }
+  socket.emit('connected', {
+    gridW: GRID_W, gridH: GRID_H, cell: CELL,
+    palette: COLORS
+  });
 
-  socket.emit('init', {
-    id: socket.id,
-    gridW: GRID_W,
-    gridH: GRID_H,
-    cell: CELL,
-    you: { name: p.name, color: p.color }
+  socket.on('join', (data) => {
+    if (players[socket.id]) return; // zaten oyunda
+    const name = sanitizeName(data && data.name);
+    const color = sanitizeColor(data && data.color);
+    const p = spawnPlayer(socket, name, color);
+    if (!p) {
+      socket.emit('serverFull');
+      return;
+    }
+    socket.emit('init', {
+      id: socket.id,
+      gridW: GRID_W,
+      gridH: GRID_H,
+      cell: CELL,
+      you: { name: p.name, color: p.color }
+    });
   });
 
   socket.on('setAngle', (angle) => {
     const pl = players[socket.id];
     if (pl && pl.alive && typeof angle === 'number' && !isNaN(angle)) {
-      pl.desiredAngle = angle;
+      pl.dir = snapDir(angle);
     }
   });
 
@@ -269,11 +309,13 @@ function tick() {
     const p = players[id];
     if (!p.alive) continue;
 
-    p.angle = stepAngle(p.angle, p.desiredAngle, TURN_RATE);
-    p.x += Math.cos(p.angle) * SPEED;
-    p.y += Math.sin(p.angle) * SPEED;
+    p.angle = p.dir.angle;
+    p.x += p.dir.x * SPEED;
+    p.y += p.dir.y * SPEED;
 
     if (p.x < 0 || p.y < 0 || p.x >= GRID_W || p.y >= GRID_H) {
+      p.x = Math.max(0, Math.min(GRID_W - 0.01, p.x));
+      p.y = Math.max(0, Math.min(GRID_H - 0.01, p.y));
       killPlayer(p, null);
       continue;
     }
@@ -285,7 +327,6 @@ function tick() {
     p.cellX = newCellX; p.cellY = newCellY;
     const i = idx(newCellX, newCellY);
 
-    // baska/kendi bir ize carpma -> olum
     if (trailGrid[i] !== -1) {
       const trailOwnerSlot = trailGrid[i];
       killPlayer(p, trailOwnerSlot === p.slot ? null : trailOwnerSlot);
@@ -293,12 +334,10 @@ function tick() {
     }
 
     if (territoryGrid[i] === p.slot) {
-      // kendi topragina donus
       if (p.trail.length > 0) {
         captureArea(p);
       }
     } else {
-      // topraksiz/dusman bolge -> iz birak
       p.trail.push({ x: newCellX, y: newCellY });
       trailGrid[i] = p.slot;
     }
@@ -318,6 +357,7 @@ function broadcastState() {
     angle: p.angle,
     alive: p.alive,
     score: p.score,
+    areaCells: p.areaCells,
     trail: p.trail
   }));
 
