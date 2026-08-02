@@ -178,6 +178,7 @@
     </div>
     <button id="playBtn">Oyuna Başla</button>
     <div id="menuError"></div>
+    <div id="returningPlayerInfo" style="display:none; margin-top:12px; font-size:11px; color:#00a3c4; background:rgba(0,163,196,0.08); border-radius:8px; padding:8px 10px;"></div>
     <div id="menuHint">Fare / WASD ile yön ver &middot; mobilde parmağınla sürükle</div>
   </div>
 </div>
@@ -237,6 +238,40 @@
   window.addEventListener('resize', resize);
 
   const socket = io();
+
+  // -------------------- CIHAZ BAZLI KALICI PROFIL --------------------
+  // Hesap/sifre yok: tarayicida rastgele, kalici bir kimlik tutulur.
+  // Sunucu bu id'ye bagli en iyi skor / kill / mac sayisini saklar.
+  function getOrCreateDeviceId(){
+    try {
+      let id = localStorage.getItem('neonArenaDeviceId');
+      if (!id) {
+        id = (window.crypto && crypto.randomUUID) ? crypto.randomUUID().replace(/-/g,'') : ('dev' + Date.now() + Math.random().toString(36).slice(2));
+        localStorage.setItem('neonArenaDeviceId', id);
+      }
+      return id;
+    } catch (e) {
+      // localStorage kapaliysa (gizli sekme vb.) her seferinde yeni id - sorun degil
+      return 'temp' + Date.now() + Math.random().toString(36).slice(2);
+    }
+  }
+  const deviceId = getOrCreateDeviceId();
+  let myProfile = null;
+
+  const returningInfoEl = document.getElementById('returningPlayerInfo');
+
+  socket.on('connect', () => { socket.emit('identify', { deviceId }); });
+
+  socket.on('profile', (prof) => {
+    myProfile = prof;
+    if (prof && prof.gamesPlayed > 0) {
+      returningInfoEl.style.display = 'block';
+      returningInfoEl.innerHTML = `Tekrar hoş geldin${prof.name ? ', ' + prof.name : ''}! ` +
+        `Rekorun: <b>${prof.bestScore}</b> skor &middot; ${prof.totalKills} kill &middot; ${prof.gamesPlayed} maç`;
+      if (prof.name && !nameInputHasValue()) nameInput.value = prof.name;
+    }
+  });
+  function nameInputHasValue(){ return document.getElementById('nameInput').value.trim().length > 0; }
 
   let myId = null;
   let GRID_W = 110, GRID_H = 74, CELL = 20;
@@ -371,7 +406,7 @@
   playBtn.addEventListener('click', () => {
     const name = nameInput.value.trim();
     Music.start();
-    socket.emit('join', { name: name || null, color: selectedColor });
+    socket.emit('join', { name: name || null, color: selectedColor, deviceId });
   });
   nameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') playBtn.click(); });
 
@@ -726,6 +761,25 @@
     ctx.globalAlpha = 1; ctx.shadowBlur = 0;
   }
 
+  // Kenara yaklasinca ekranda hafif kirmizi bir uyari (vinyet) goster -
+  // "haksiz" hissettiren ani duvar olumlerini azaltmak icin.
+  const EDGE_WARNING_CELLS = 4;
+  function drawEdgeWarning(t, me){
+    if (!me || !me.alive) return;
+    const minDist = Math.min(me.x, GRID_W - me.x, me.y, GRID_H - me.y);
+    if (minDist >= EDGE_WARNING_CELLS) return;
+    let intensity = 1 - Math.max(0, minDist) / EDGE_WARNING_CELLS;
+    intensity *= 0.8 + 0.2 * Math.sin(t * 0.012); // hafif nabiz
+    const grad = ctx.createRadialGradient(
+      canvas.width/2, canvas.height/2, canvas.height*0.32,
+      canvas.width/2, canvas.height/2, canvas.height*0.75
+    );
+    grad.addColorStop(0, 'rgba(224,48,74,0)');
+    grad.addColorStop(1, `rgba(224,48,74,${0.4*intensity})`);
+    ctx.fillStyle = grad;
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+  }
+
   function drawMinimap(){
     miniCtx.fillStyle = 'rgba(255,255,255,0.9)';
     miniCtx.fillRect(0,0,mini.width, mini.height);
@@ -787,6 +841,8 @@
     drawPlayers(t);
     drawParticles();
     ctx.restore();
+
+    drawEdgeWarning(t, me);
 
     updateHud(latestState, me);
     drawMinimap();
