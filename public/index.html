@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NEON ARENA</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body {
+    width:100%; height:100%; overflow:hidden;
+    background:#05050a;
+    font-family:'Trebuchet MS', 'Segoe UI', sans-serif;
+    color:#e8f9ff;
+  }
+  #gameCanvas { display:block; background:#05050a; cursor:crosshair; }
+
+  .hud {
+    position:fixed; z-index:5; pointer-events:none;
+    text-shadow:0 0 6px rgba(0,229,255,0.8);
+  }
+
+  #leaderboard {
+    top:16px; right:16px;
+    background:rgba(10,10,20,0.55);
+    border:1px solid rgba(0,229,255,0.4);
+    border-radius:10px;
+    padding:12px 16px;
+    min-width:200px;
+    box-shadow:0 0 18px rgba(0,229,255,0.25);
+    backdrop-filter: blur(4px);
+  }
+  #leaderboard h3 {
+    font-size:13px; letter-spacing:2px; color:#00e5ff;
+    margin-bottom:8px; text-transform:uppercase;
+  }
+  #leaderboard ol { list-style:none; }
+  #leaderboard li {
+    display:flex; justify-content:space-between; gap:12px;
+    font-size:13px; padding:2px 0;
+  }
+  #leaderboard li span.name { display:flex; align-items:center; gap:6px; }
+  #leaderboard .dot {
+    width:9px; height:9px; border-radius:50%;
+    display:inline-block; box-shadow:0 0 6px currentColor;
+  }
+
+  #hudSelf {
+    left:16px; bottom:16px;
+    background:rgba(10,10,20,0.55);
+    border:1px solid rgba(255,32,121,0.4);
+    border-radius:10px;
+    padding:10px 16px;
+    box-shadow:0 0 18px rgba(255,32,121,0.25);
+    font-size:14px;
+    min-width:170px;
+  }
+  #hudSelf .big { font-size:22px; font-weight:bold; color:#ff2079; }
+
+  #title {
+    top:16px; left:16px;
+    font-size:20px; font-weight:bold; letter-spacing:3px;
+    color:#00e5ff;
+  }
+  #title span { color:#ff2079; }
+
+  #status {
+    top:56px; left:16px; font-size:12px; color:#8ff;
+    opacity:0.8;
+  }
+
+  #deathOverlay {
+    position:fixed; inset:0; z-index:20;
+    display:none; align-items:center; justify-content:center; flex-direction:column;
+    background:rgba(5,5,12,0.82);
+    text-align:center;
+  }
+  #deathOverlay h1 {
+    font-size:44px; color:#ff2079; text-shadow:0 0 22px #ff2079;
+    letter-spacing:4px;
+  }
+  #deathOverlay p { margin-top:10px; font-size:15px; color:#9fe; }
+
+  #killToast {
+    position:fixed; z-index:10; top:90px; left:50%; transform:translateX(-50%);
+    background:rgba(10,10,20,0.7); border:1px solid #7cff00;
+    color:#7cff00; padding:6px 18px; border-radius:20px;
+    font-size:13px; box-shadow:0 0 14px rgba(124,255,0,0.5);
+    display:none;
+  }
+</style>
+</head>
+<body>
+
+<canvas id="gameCanvas"></canvas>
+
+<div id="title" class="hud">NEON <span>ARENA</span></div>
+<div id="status" class="hud">bağlanıyor...</div>
+
+<div id="leaderboard" class="hud">
+  <h3>Liderlik Tablosu</h3>
+  <ol id="lbList"></ol>
+</div>
+
+<div id="hudSelf" class="hud">
+  <div>SKOR: <span id="myScore" class="big">0</span></div>
+  <div>ALAN: <span id="myArea">0%</span></div>
+</div>
+
+<div id="killToast"></div>
+
+<div id="deathOverlay">
+  <h1>ELENDİN</h1>
+  <p id="respawnText">Yeniden doğuyorsun...</p>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+(function(){
+  const canvas = document.getElementById('gameCanvas');
+  const ctx = canvas.getContext('2d');
+  function resize(){ canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
+  window.addEventListener('resize', resize);
+  resize();
+
+  const socket = io();
+
+  let myId = null;
+  let GRID_W = 60, GRID_H = 40, CELL = 20;
+  let latestState = null; // { players, territory, slotColors, totalCells }
+  let myName = '', myColor = '#00e5ff';
+
+  const statusEl = document.getElementById('status');
+  const lbList = document.getElementById('lbList');
+  const myScoreEl = document.getElementById('myScore');
+  const myAreaEl = document.getElementById('myArea');
+  const deathOverlay = document.getElementById('deathOverlay');
+  const respawnText = document.getElementById('respawnText');
+  const killToast = document.getElementById('killToast');
+
+  socket.on('connect', () => { statusEl.textContent = 'bağlandı — hayatta kal ve toprak kapla!'; });
+  socket.on('disconnect', () => { statusEl.textContent = 'bağlantı kesildi...'; });
+  socket.on('serverFull', () => { statusEl.textContent = 'sunucu dolu, daha sonra tekrar dene.'; });
+
+  socket.on('init', (data) => {
+    myId = data.id;
+    GRID_W = data.gridW; GRID_H = data.gridH; CELL = data.cell;
+    myName = data.you.name; myColor = data.you.color;
+    statusEl.textContent = 'İsim: ' + myName;
+  });
+
+  socket.on('state', (data) => { latestState = data; });
+
+  socket.on('youDied', (data) => {
+    deathOverlay.style.display = 'flex';
+    let secs = Math.ceil(data.respawnMs / 1000);
+    respawnText.textContent = secs + ' saniye sonra yeniden doğuyorsun...';
+    const t = setInterval(() => {
+      secs -= 1;
+      if (secs <= 0) { clearInterval(t); deathOverlay.style.display = 'none'; }
+      else respawnText.textContent = secs + ' saniye sonra yeniden doğuyorsun...';
+    }, 1000);
+  });
+
+  socket.on('killConfirm', (data) => {
+    killToast.textContent = '⚡ ' + data.victim + ' izini kesildi!';
+    killToast.style.display = 'block';
+    clearTimeout(killToast._t);
+    killToast._t = setTimeout(() => killToast.style.display = 'none', 1800);
+  });
+
+  // -------------------- KONTROLLER --------------------
+  let desiredAngle = -Math.PI/2;
+  let usingKeys = false;
+  const keyAngles = { 'w':-Math.PI/2, 'arrowup':-Math.PI/2, 's':Math.PI/2, 'arrowdown':Math.PI/2,
+                      'a':Math.PI, 'arrowleft':Math.PI, 'd':0, 'arrowright':0 };
+
+  window.addEventListener('keydown', (e) => {
+    const k = e.key.toLowerCase();
+    if (k in keyAngles) {
+      usingKeys = true;
+      desiredAngle = keyAngles[k];
+      socket.emit('setAngle', desiredAngle);
+    }
+  });
+
+  canvas.addEventListener('mousemove', (e) => {
+    usingKeys = false;
+    const dx = e.clientX - canvas.width/2;
+    const dy = e.clientY - canvas.height/2;
+    desiredAngle = Math.atan2(dy, dx);
+    socket.emit('setAngle', desiredAngle);
+  });
+
+  // -------------------- RENDER --------------------
+  function findMe(state){
+    if(!state) return null;
+    for(const p of state.players) if(p.id === myId) return p;
+    return null;
+  }
+
+  function drawGrid(camX, camY){
+    ctx.strokeStyle = 'rgba(0,229,255,0.06)';
+    ctx.lineWidth = 1;
+    const startX = Math.floor(camX / CELL) - 1;
+    const endX = Math.ceil((camX + canvas.width) / CELL) + 1;
+    const startY = Math.floor(camY / CELL) - 1;
+    const endY = Math.ceil((camY + canvas.height) / CELL) + 1;
+    ctx.beginPath();
+    for (let gx = startX; gx <= endX; gx++){
+      const sx = gx*CELL - camX;
+      ctx.moveTo(sx, 0); ctx.lineTo(sx, canvas.height);
+    }
+    for (let gy = startY; gy <= endY; gy++){
+      const sy = gy*CELL - camY;
+      ctx.moveTo(0, sy); ctx.lineTo(canvas.width, sy);
+    }
+    ctx.stroke();
+  }
+
+  function hexToRgba(hex, alpha){
+    const r = parseInt(hex.slice(1,3),16);
+    const g = parseInt(hex.slice(3,5),16);
+    const b = parseInt(hex.slice(5,7),16);
+    return `rgba(${r},${g},${b},${alpha})`;
+  }
+
+  function draw(){
+    requestAnimationFrame(draw);
+    ctx.fillStyle = '#05050a';
+    ctx.fillRect(0,0,canvas.width, canvas.height);
+
+    if (!latestState) return;
+    const me = findMe(latestState);
+    const camX = (me ? me.x*CELL : GRID_W*CELL/2) - canvas.width/2;
+    const camY = (me ? me.y*CELL : GRID_H*CELL/2) - canvas.height/2;
+
+    ctx.save();
+    ctx.translate(-camX, -camY);
+
+    drawGrid(camX, camY);
+
+    ctx.strokeStyle = 'rgba(255,32,121,0.5)';
+    ctx.lineWidth = 3;
+    ctx.strokeRect(0,0, GRID_W*CELL, GRID_H*CELL);
+
+    const territory = latestState.territory;
+    const slotColors = latestState.slotColors;
+    const startX = Math.max(0, Math.floor(camX / CELL) - 1);
+    const endX = Math.min(GRID_W, Math.ceil((camX + canvas.width) / CELL) + 1);
+    const startY = Math.max(0, Math.floor(camY / CELL) - 1);
+    const endY = Math.min(GRID_H, Math.ceil((camY + canvas.height) / CELL) + 1);
+
+    for (let gy = startY; gy < endY; gy++){
+      for (let gx = startX; gx < endX; gx++){
+        const slot = territory[gy*GRID_W+gx];
+        if (slot === -1) continue;
+        const color = slotColors[slot] || '#444';
+        ctx.fillStyle = hexToRgba(color, 0.25);
+        ctx.fillRect(gx*CELL, gy*CELL, CELL, CELL);
+      }
+    }
+
+    for (const p of latestState.players){
+      if (!p.trail || p.trail.length < 1) continue;
+      ctx.strokeStyle = p.color;
+      ctx.shadowColor = p.color;
+      ctx.shadowBlur = 10;
+      ctx.lineWidth = CELL*0.6;
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      ctx.moveTo(p.trail[0].x*CELL + CELL/2, p.trail[0].y*CELL + CELL/2);
+      for (let i=1; i<p.trail.length; i++){
+        ctx.lineTo(p.trail[i].x*CELL + CELL/2, p.trail[i].y*CELL + CELL/2);
+      }
+      ctx.lineTo(p.x*CELL, p.y*CELL);
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+    }
+
+    for (const p of latestState.players){
+      if (!p.alive) continue;
+      ctx.save();
+      ctx.translate(p.x*CELL, p.y*CELL);
+      ctx.shadowColor = p.color;
+      ctx.shadowBlur = 18;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(0,0, CELL*0.55, 0, Math.PI*2);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+
+      ctx.rotate(p.angle);
+      ctx.fillStyle = '#05050a';
+      ctx.beginPath();
+      ctx.moveTo(CELL*0.35,0); ctx.lineTo(-CELL*0.15, -CELL*0.22); ctx.lineTo(-CELL*0.15, CELL*0.22);
+      ctx.closePath(); ctx.fill();
+      ctx.restore();
+
+      ctx.font = '11px Trebuchet MS';
+      ctx.fillStyle = 'rgba(255,255,255,0.85)';
+      ctx.textAlign = 'center';
+      ctx.fillText(p.name, p.x*CELL, p.y*CELL - CELL*0.9);
+    }
+
+    ctx.restore();
+
+    updateHud(latestState, me);
+  }
+
+  function updateHud(state, me){
+    const top = [...state.players].sort((a,b)=>b.score-a.score).slice(0,8);
+    lbList.innerHTML = top.map(p => `
+      <li>
+        <span class="name"><span class="dot" style="color:${p.color}; background:${p.color};"></span>${p.name}${p.id===myId ? ' (Sen)' : ''}</span>
+        <span>${p.score}</span>
+      </li>
+    `).join('');
+
+    if (me){
+      myScoreEl.textContent = me.score;
+      const pct = ((me.score) / state.totalCells * 100);
+      myAreaEl.textContent = (pct < 0 ? 0 : pct).toFixed(1) + '%';
+    }
+  }
+
+  draw();
+})();
+</script>
+</body>
+</html>
